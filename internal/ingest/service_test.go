@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -80,5 +81,73 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+// TestDuplicateDeliveryDoesNotDoubleCountStats verifies that the account_stats
+// and in-memory cache are each incremented exactly once when the same event
+// is delivered multiple times.
+func TestDuplicateDeliveryDoesNotDoubleCountStats(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	for i := 0; i < 3; i++ {
+		if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+			t.Fatalf("delivery %d: got %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("call_count = %d, want 1 (duplicate deliveries must not double-count)", got.CallCount)
+	}
+	if got.TotalDurationSec != 143 {
+		t.Fatalf("total_duration_sec = %d, want 143", got.TotalDurationSec)
+	}
+}
+
+// TestConcurrentDuplicateDeliveryIsIdempotent fires the same event_id from
+// multiple goroutines simultaneously.
+func TestConcurrentDuplicateDeliveryIsIdempotent(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			resp := post(t, srv.URL+"/webhooks/calls", body)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var n int
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("concurrent duplicates: stored %d events, want exactly 1", n)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("concurrent duplicates: call_count = %d, want 1", got.CallCount)
 	}
 }

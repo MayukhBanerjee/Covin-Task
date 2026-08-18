@@ -36,16 +36,11 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
+//
+// Idempotency guarantee: the events table has a UNIQUE constraint on event_id.
+// We attempt the INSERT directly and treat a unique-violation as a duplicate
+// delivery — no separate SELECT needed, so there is no TOCTOU window.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,9 +56,17 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.InsertEventIdempotent(ctx, rec)
+	if err != nil {
 		return err
 	}
+	if !inserted {
+		// Duplicate delivery — already processed, return 200 to stop retries.
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
+	}
+
 	if err := s.store.UpsertCall(ctx, rec); err != nil {
 		return err
 	}

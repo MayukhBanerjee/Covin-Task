@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -59,6 +60,7 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 func (s *Store) Close() { s.pool.Close() }
 
 // EventExists reports whether an event with this ID has already been stored.
+// Kept for use in tests; the hot path should use InsertEventIdempotent instead.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
 	err := s.pool.QueryRow(ctx,
@@ -72,7 +74,34 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
+// InsertEventIdempotent attempts to insert a raw delivery.  It returns
+// (true, nil) when the row was newly inserted, and (false, nil) when a row
+// with the same event_id already exists (duplicate delivery).  Any other
+// database error is returned as-is.
+//
+// This is the correct idempotency primitive: a single INSERT … ON CONFLICT DO
+// NOTHING is atomic — there is no TOCTOU window between a SELECT check and a
+// subsequent INSERT.
+func (s *Store) InsertEventIdempotent(ctx context.Context, e Event) (inserted bool, err error) {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		// Catch the unique violation for databases that raise it before the
+		// ON CONFLICT clause is processed (edge case with pgx).
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return false, nil
+		}
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// InsertEvent stores the raw delivery.  Prefer InsertEventIdempotent for
+// production use; this variant is retained for tests that pre-stage rows.
 func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
