@@ -1,6 +1,7 @@
 package stats_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/stats"
@@ -28,5 +29,28 @@ func TestCacheGetUnknownAccountIsZero(t *testing.T) {
 	c := stats.NewCache()
 	if got := c.Get("nobody"); got.CallCount != 0 || got.TotalDurationSec != 0 {
 		t.Fatalf("got %+v, want zero value", got)
+	}
+}
+
+// TestCacheRecordConcurrentIsSafe fails under the race detector when Record()
+// does not hold a lock. It demonstrates that the missing mutex in the original
+// code causes a data race.
+func TestCacheRecordConcurrentIsSafe(t *testing.T) {
+	const goroutines = 50
+	c := stats.NewCache()
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			c.Record("acc_concurrent", 1)
+		}()
+	}
+	wg.Wait()
+
+	got := c.Get("acc_concurrent")
+	if got.CallCount != goroutines {
+		t.Fatalf("got CallCount=%d, want %d (data race lost updates)", got.CallCount, goroutines)
 	}
 }
