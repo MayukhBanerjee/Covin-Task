@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,11 +23,22 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	// wg tracks background recording goroutines so Shutdown can drain them
+	// before the process exits.
+	wg sync.WaitGroup
 }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
+}
+
+// Shutdown waits for all in-flight recording goroutines to finish.  Call this
+// after the HTTP server has stopped accepting new requests so that no new
+// goroutines can be spawned while we are draining.
+func (s *Service) Shutdown() {
+	s.wg.Wait()
 }
 
 // Stats returns the cached totals for an account.
@@ -79,7 +91,9 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// We use a detached background context because the HTTP request context
 	// is cancelled the moment the response is written.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			bgCtx := context.Background()
 			if err := s.processRecording(bgCtx, rec); err != nil {
 				s.log.Error("processRecording failed",

@@ -60,4 +60,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
 	}
+	// Wait for background recording goroutines to finish so that
+	// MarkRecordingProcessed calls are not abandoned on deploy/restart.
+	svc.Shutdown()
 }
