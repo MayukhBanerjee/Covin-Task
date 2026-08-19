@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -150,4 +151,34 @@ func TestConcurrentDuplicateDeliveryIsIdempotent(t *testing.T) {
 	if got.CallCount != 1 {
 		t.Fatalf("concurrent duplicates: call_count = %d, want 1", got.CallCount)
 	}
+}
+
+// TestRecordingIsMarkedProcessed verifies that after Ingest returns the
+// background goroutine eventually marks the recording as processed in the
+// database.
+func TestRecordingIsMarkedProcessed(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// The recording goroutine runs asynchronously; poll for up to 2 seconds.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var processed bool
+		row := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+		if err := row.Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if processed {
+			return // pass
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("recording_processed was never set to true (request-context cancellation bug?)")
 }
